@@ -1,0 +1,7 @@
+/target
+*.pdb
+.env
+lanehub-*.zip
+.release-notes.md
+task/
+modal/__pycache__/

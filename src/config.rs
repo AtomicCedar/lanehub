@@ -1,0 +1,155 @@
+//! Optional JSON configuration file support.
+//!
+//! Search order (first match wins):
+//! 1. Explicit `--config <path>` (error if missing)
+//! 2. `$LANEHUB_CONFIG`
+//! 3. `./lanehub.json` (current working directory)
+//! 4. `~/.config/lanehub/config.json`
+//!
+//! CLI flags always override config file values. Missing files simply yield defaults.
+
+use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Config {
+    /// Listen address for the gateway, e.g. `"127.0.0.1:18788"`.
+    pub bind: Option<SocketAddr>,
+    /// Egress specs: `auto`, `direct`, `ipv6`, `ipv4`, `http://...`, `socks5://...`, `bind://...`,
+    /// `relay://https://relay-host#key=...` (serverless fresh-IP egress, see modal/relay.py).
+    pub egress: Option<Vec<String>>,
+    /// Disable cross-model automatic failover.
+    pub no_failover: Option<bool>,
+    /// Require clients to present `Authorization: Bearer <key>`.
+    pub api_key: Option<String>,
+    /// Background health prober interval in seconds (0 disables the prober).
+    pub probe_interval_secs: Option<u64>,
+}
+
+impl Config {
+    /// Load `.env` files from standard locations (`./.env`, `./.raphael/.env`, `~/.raphael/.env`)
+    /// so standalone `lanehub` automatically picks up free-pool keys.
+    pub fn load_bundled_env() {
+        let mut paths = vec![PathBuf::from(".env"), PathBuf::from(".raphael").join(".env")];
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            paths.push(home.join(".raphael").join(".env"));
+        }
+        for path in paths {
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            for raw_line in text.lines() {
+                let line = raw_line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let line = line.strip_prefix("export ").unwrap_or(line).trim();
+                if let Some((k, v)) = line.split_once('=') {
+                    let key = k.trim();
+                    let val = v.trim().trim_matches('"').trim_matches('\'');
+                    if !key.is_empty() && std::env::var_os(key).is_none() {
+                        std::env::set_var(key, val);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Load the effective configuration file, if any. Returns `(config, path)`.
+    pub fn load(explicit: Option<&Path>) -> Result<(Config, Option<PathBuf>), String> {
+        Self::load_bundled_env();
+        let path = match explicit {
+            Some(p) => {
+                if !p.exists() {
+                    return Err(format!("config file not found: {}", p.display()));
+                }
+                Some(p.to_path_buf())
+            }
+            None => Self::discover(),
+        };
+        let Some(path) = path else {
+            return Ok((Config::default(), None));
+        };
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|e| format!("failed to read config {}: {e}", path.display()))?;
+        let cfg: Config = serde_json::from_str(&raw)
+            .map_err(|e| format!("failed to parse config {}: {e}", path.display()))?;
+        Ok((cfg, Some(path)))
+    }
+
+    /// Persist this config as JSON, creating parent directories as needed.
+    pub fn save_to(&self, path: &Path) -> Result<(), String> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+        }
+        let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
+        std::fs::write(path, json).map_err(|e| format!("cannot write {}: {e}", path.display()))
+    }
+
+    fn discover() -> Option<PathBuf> {
+        if let Ok(p) = std::env::var("LANEHUB_CONFIG") {
+            let p = PathBuf::from(p);
+            if p.exists() {
+                return Some(p);
+            }
+        }
+        let cwd = PathBuf::from("lanehub.json");
+        if cwd.exists() {
+            return Some(cwd);
+        }
+        candidate_paths().into_iter().find(|p| p.exists())
+    }
+}
+
+fn candidate_paths() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(h) = std::env::var("HOME") {
+        out.push(PathBuf::from(h).join(".config/lanehub/config.json"));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_explicit_file_is_an_error() {
+        assert!(Config::load(Some(Path::new("definitely-missing-lanehub.json"))).is_err());
+    }
+
+    #[test]
+    fn roundtrip_save_and_load() {
+        let dir = std::env::temp_dir().join(format!("lanehub-cfg-test-{}", std::process::id()));
+        let path = dir.join("config.json");
+        let cfg = Config {
+            bind: Some("127.0.0.1:19999".parse().unwrap()),
+            egress: Some(vec!["ipv4".into(), "socks5://127.0.0.1:1080".into()]),
+            no_failover: Some(true),
+            api_key: Some("secret".into()),
+            probe_interval_secs: Some(60),
+        };
+        cfg.save_to(&path).expect("save");
+        let (loaded, _) = Config::load(Some(&path)).expect("load");
+        assert_eq!(loaded.bind, cfg.bind);
+        assert_eq!(loaded.egress, cfg.egress);
+        assert_eq!(loaded.no_failover, cfg.no_failover);
+        assert_eq!(loaded.api_key, cfg.api_key);
+        assert_eq!(loaded.probe_interval_secs, cfg.probe_interval_secs);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn partial_file_fills_defaults() {
+        let dir = std::env::temp_dir().join(format!("lanehub-cfg-test2-{}", std::process::id()));
+        let path = dir.join("config.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, r#"{"bind": "0.0.0.0:8080"}"#).unwrap();
+        let (loaded, _) = Config::load(Some(&path)).expect("load");
+        assert_eq!(loaded.bind, Some("0.0.0.0:8080".parse().unwrap()));
+        assert!(loaded.egress.is_none());
+        assert_eq!(loaded.probe_interval_secs, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
